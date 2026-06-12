@@ -51,22 +51,23 @@ CHAINEX_BASE = "https://api.chainex.io"
 
 def fetch_candles() -> list:
     """
-    CoinGecko /coins/{id}/ohlc returns OHLC candles.
-    For days=1 or 2 → 30-min candles (free tier resolution).
-    Returns list of dicts: {ts, open, high, low, close}
+    CoinGecko /coins/{id}/market_chart -- free tier, no key needed.
+    Returns hourly price points for last 2 days.
     """
     url = (f"https://api.coingecko.com/api/v3/coins/{COINGECKO_COIN}"
-           f"/ohlc?vs_currency={COINGECKO_VS}&days={COINGECKO_DAYS}")
+           f"/market_chart?vs_currency={COINGECKO_VS}&days={COINGECKO_DAYS}"
+           f"&interval=hourly")
     try:
-        r = requests.get(url, timeout=15)
+        r = requests.get(url, timeout=15,
+                         headers={"Accept": "application/json"})
         r.raise_for_status()
-        raw = r.json()  # [[timestamp_ms, open, high, low, close], ...]
+        prices = r.json().get("prices", [])
         candles = [
-            {"ts": c[0] // 1000, "open": c[1], "high": c[2],
-             "low": c[3], "close": c[4]}
-            for c in raw
+            {"ts": p[0] // 1000, "open": p[1], "high": p[1],
+             "low": p[1], "close": p[1]}
+            for p in prices
         ]
-        log.info(f"CoinGecko: {len(candles)} candles (XRP/ZAR)")
+        log.info(f"CoinGecko: {len(candles)} price points (XRP/ZAR)")
         return candles
     except Exception as e:
         log.error(f"CoinGecko fetch failed: {e}")
