@@ -1,8 +1,8 @@
 """
-ChainEX XRP/ZAR EMA Crossover Bot  (v4 — correct auth headers + URL format)
+ChainEX XRP/ZAR EMA Crossover Bot  (v5 — CoinGecko price data)
 Strategy: 9/21 EMA crossover + RSI filter
-Exchange: ChainEX (South Africa)
-Pair: XRP/ZAR
+Price data: CoinGecko free API (no key needed)
+Orders/Balances: ChainEX API
 """
 
 import os
@@ -20,30 +20,78 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── Config ────────────────────────────────────────────────────────────────────
 PUBLIC_KEY  = os.environ.get("CHAINEX_PUBLIC_KEY", "")
 PRIVATE_KEY = os.environ.get("CHAINEX_PRIVATE_KEY", "")
 
 COIN     = "XRP"
 EXCHANGE = "ZAR"
 
-EMA_FAST = int(os.environ.get("EMA_FAST", 9))
-EMA_SLOW = int(os.environ.get("EMA_SLOW", 21))
+EMA_FAST   = int(os.environ.get("EMA_FAST", 9))
+EMA_SLOW   = int(os.environ.get("EMA_SLOW", 21))
 RSI_PERIOD = int(os.environ.get("RSI_PERIOD", 14))
-RSI_OB   = float(os.environ.get("RSI_OB", 70))
-RSI_OS   = float(os.environ.get("RSI_OS", 30))
+RSI_OB     = float(os.environ.get("RSI_OB", 70))
+RSI_OS     = float(os.environ.get("RSI_OS", 30))
 
-TRADE_ZAR = float(os.environ.get("TRADE_ZAR", 0))
-TRADE_PCT = float(os.environ.get("TRADE_PCT", 0.95))
+TRADE_ZAR  = float(os.environ.get("TRADE_ZAR", 0))
+TRADE_PCT  = float(os.environ.get("TRADE_PCT", 0.95))
+
 START_IN_POSITION = os.environ.get("START_IN_POSITION", "true").lower() == "true"
-POLL_SECS = int(os.environ.get("POLL_SECS", 300))
+POLL_SECS  = int(os.environ.get("POLL_SECS", 300))   # 5 min candles
 
-BASE_URL = "https://api.chainex.io"
+# CoinGecko: 'ripple' = XRP, vs_currency = 'zar', days of history
+COINGECKO_COIN = "ripple"
+COINGECKO_VS   = "zar"
+COINGECKO_DAYS = 2    # last 2 days gives 5-min candles (free tier)
 
+CHAINEX_BASE = "https://api.chainex.io"
+
+
+# ── Price data from CoinGecko ─────────────────────────────────────────────────
+
+def fetch_candles() -> list:
+    """
+    CoinGecko /coins/{id}/ohlc returns OHLC candles.
+    For days=1 or 2 → 30-min candles (free tier resolution).
+    Returns list of dicts: {ts, open, high, low, close}
+    """
+    url = (f"https://api.coingecko.com/api/v3/coins/{COINGECKO_COIN}"
+           f"/ohlc?vs_currency={COINGECKO_VS}&days={COINGECKO_DAYS}")
+    try:
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        raw = r.json()  # [[timestamp_ms, open, high, low, close], ...]
+        candles = [
+            {"ts": c[0] // 1000, "open": c[1], "high": c[2],
+             "low": c[3], "close": c[4]}
+            for c in raw
+        ]
+        log.info(f"CoinGecko: {len(candles)} candles (XRP/ZAR)")
+        return candles
+    except Exception as e:
+        log.error(f"CoinGecko fetch failed: {e}")
+        return []
+
+
+def fetch_current_price() -> float:
+    """Simple spot price from CoinGecko."""
+    url = (f"https://api.coingecko.com/api/v3/simple/price"
+           f"?ids={COINGECKO_COIN}&vs_currencies={COINGECKO_VS}")
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        return float(r.json()[COINGECKO_COIN][COINGECKO_VS])
+    except Exception as e:
+        log.error(f"CoinGecko price fetch failed: {e}")
+        return 0.0
+
+
+# ── ChainEX API Client (orders + balances only) ───────────────────────────────
 
 class ChainEXClient:
-    def __init__(self, public_key, private_key):
-        self.pub  = public_key
-        self.priv = private_key
+    def __init__(self, pub, priv):
+        self.pub  = pub
+        self.priv = priv
 
     def _sign(self, payload: str) -> str:
         return hmac.new(
@@ -52,130 +100,118 @@ class ChainEXClient:
             hashlib.sha256
         ).hexdigest()
 
-    def _private(self, endpoint: str, body: dict = None) -> dict:
+    def _request(self, endpoint: str, body: dict = None) -> dict:
         """
-        ChainEX private API:
-        - POST with JSON body
-        - Headers: api-key, api-signature (HMAC of JSON body string), api-nonce
+        Try multiple auth styles until one works.
+        Logs exactly what came back so we can tune if needed.
         """
         body = body or {}
-        nonce = str(int(time.time() * 1000))
+        nonce    = str(int(time.time() * 1000))
         body_str = json.dumps(body, separators=(',', ':')) if body else "{}"
-        signature = self._sign(body_str)
 
-        headers = {
-            "Content-Type":  "application/json",
-            "api-key":       self.pub,
-            "api-nonce":     nonce,
-            "api-signature": signature,
-        }
-        r = requests.post(
-            f"{BASE_URL}{endpoint}",
-            headers=headers,
-            data=body_str,
-            timeout=10
-        )
-        log.debug(f"POST {endpoint} → {r.status_code}: {r.text[:200]}")
-        r.raise_for_status()
-        return r.json()
+        # Style A: JSON body + header auth (most modern exchanges)
+        try:
+            sig = self._sign(body_str)
+            headers = {
+                "Content-Type":  "application/json",
+                "api-key":       self.pub,
+                "api-nonce":     nonce,
+                "api-signature": sig,
+            }
+            r = requests.post(f"{CHAINEX_BASE}{endpoint}",
+                              headers=headers, data=body_str, timeout=10)
+            log.debug(f"[A] POST {endpoint} → {r.status_code}: {r.text[:120]}")
+            if r.status_code == 200:
+                return r.json()
+        except Exception as e:
+            log.debug(f"[A] failed: {e}")
 
-    def _public(self, endpoint: str) -> dict:
-        r = requests.get(f"{BASE_URL}{endpoint}", timeout=10)
-        log.debug(f"GET {endpoint} → {r.status_code}: {r.text[:200]}")
-        r.raise_for_status()
-        return r.json()
+        # Style B: form-encoded body + query-string signature
+        try:
+            params = {**body, "nonce": nonce, "api_key": self.pub}
+            qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+            params["signature"] = self._sign(qs)
+            r = requests.post(f"{CHAINEX_BASE}{endpoint}",
+                              data=params, timeout=10)
+            log.debug(f"[B] POST {endpoint} → {r.status_code}: {r.text[:120]}")
+            if r.status_code == 200:
+                return r.json()
+        except Exception as e:
+            log.debug(f"[B] failed: {e}")
 
-    # ── Market data ──────────────────────────────────────────────────────────
-    def get_trade_history(self, coin, exchange, limit=200) -> list:
-        # Try both URL formats
-        for path in [
-            f"/market/tradehistory/{coin}_{exchange}/{limit}",
-            f"/market/tradehistory/{coin}/{exchange}/{limit}",
-            f"/market/history/{coin}_{exchange}",
-        ]:
-            try:
-                data = self._public(path)
-                result = data.get("data", [])
-                if result:
-                    log.info(f"Trade history OK via {path} ({len(result)} trades)")
-                    return result
-            except Exception as e:
-                log.warning(f"Trade history path {path} failed: {e}")
-        return []
+        # Style C: GET with query-string signature
+        try:
+            params = {**body, "nonce": nonce, "api_key": self.pub}
+            qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+            params["signature"] = self._sign(qs)
+            r = requests.get(f"{CHAINEX_BASE}{endpoint}",
+                             params=params, timeout=10)
+            log.debug(f"[C] GET  {endpoint} → {r.status_code}: {r.text[:120]}")
+            if r.status_code == 200:
+                return r.json()
+        except Exception as e:
+            log.debug(f"[C] failed: {e}")
 
-    def get_orderbook(self, coin, exchange) -> dict:
-        for path in [
-            f"/market/orderbook/{coin}_{exchange}",
-            f"/market/orderbook/{coin}/{exchange}",
-        ]:
-            try:
-                data = self._public(path)
-                result = data.get("data", {})
-                if result:
-                    return result
-            except Exception as e:
-                log.warning(f"Orderbook path {path} failed: {e}")
+        log.warning(f"All auth styles failed for {endpoint}")
         return {}
 
-    def get_market_summary(self, coin, exchange) -> dict:
-        for path in [
-            f"/market/summary/{coin}_{exchange}",
-            f"/market/summary/{coin}/{exchange}",
-        ]:
+    def get_balances(self) -> dict:
+        for ep in ["/wallet/balances", "/account/balance",
+                   "/user/balance", "/balances"]:
+            data = self._request(ep)
+            raw  = data.get("data", [])
+            if not raw:
+                continue
+            if isinstance(raw, dict):
+                raw = list(raw.values())
+            balances = {}
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                code = (item.get("coin_code") or item.get("code") or
+                        item.get("currency") or "")
+                if code:
+                    balances[code.upper()] = {
+                        "available": float(item.get("available_balance",
+                                     item.get("available", 0))),
+                        "total":     float(item.get("balance",
+                                     item.get("total", 0))),
+                    }
+            if balances:
+                log.info(f"Balances OK via {ep}: {list(balances.keys())}")
+                return balances
+        log.warning("Balance fetch failed — using 0 values.")
+        return {}
+
+    def get_orderbook(self) -> dict:
+        for ep in [f"/market/orderbook/XRP_ZAR",
+                   f"/market/orderbook/XRP/ZAR",
+                   f"/orderbook/XRP_ZAR"]:
             try:
-                data = self._public(path)
-                return data.get("data", {})
+                r = requests.get(f"{CHAINEX_BASE}{ep}", timeout=10)
+                if r.status_code == 200:
+                    data = r.json().get("data", {})
+                    if data:
+                        log.info(f"Orderbook OK via {ep}")
+                        return data
             except Exception:
                 pass
         return {}
 
-    # ── Account ───────────────────────────────────────────────────────────────
-    def get_balances(self) -> dict:
-        # Try multiple known endpoint patterns
-        for endpoint in ["/wallet/balances", "/account/balances", "/user/balances"]:
-            try:
-                data = self._private(endpoint)
-                raw = data.get("data", [])
-                if raw is None:
-                    continue
-                if isinstance(raw, dict):
-                    raw = list(raw.values())
-                balances = {}
-                for item in raw:
-                    if isinstance(item, dict):
-                        code = (item.get("coin_code") or item.get("code") or
-                                item.get("currency") or "")
-                        if code:
-                            balances[code.upper()] = {
-                                "available": float(item.get("available_balance",
-                                             item.get("available", 0))),
-                                "total":     float(item.get("balance",
-                                             item.get("total", 0))),
-                            }
-                if balances:
-                    log.info(f"Balances via {endpoint}: {list(balances.keys())}")
-                    return balances
-            except Exception as e:
-                log.warning(f"Balance endpoint {endpoint} failed: {e}")
-        log.error("All balance endpoints failed.")
-        return {}
-
-    # ── Orders ────────────────────────────────────────────────────────────────
-    def place_order(self, coin, exchange, price, amount, order_type) -> dict:
+    def place_order(self, price: float, amount: float, side: str) -> dict:
         body = {
-            "coin_code":     coin,
-            "exchange_code": exchange,
+            "coin_code":     COIN,
+            "exchange_code": EXCHANGE,
             "price":         str(round(price, 4)),
             "amount":        str(round(amount, 4)),
-            "type":          order_type,
+            "type":          side,   # "buy" or "sell"
         }
-        for endpoint in ["/trading/addorder", "/order/add", "/trade/order"]:
-            try:
-                resp = self._private(endpoint, body)
-                log.info(f"Order placed via {endpoint}: {resp}")
-                return resp
-            except Exception as e:
-                log.warning(f"Order endpoint {endpoint} failed: {e}")
+        for ep in ["/trading/addorder", "/order/add", "/trade/add"]:
+            data = self._request(ep, body)
+            if data:
+                log.info(f"Order placed via {ep}: {data}")
+                return data
+        log.error("Order placement failed on all endpoints.")
         return {}
 
 
@@ -195,68 +231,38 @@ def rsi(prices, period=14):
     result = [None] * len(prices)
     if len(prices) < period + 1:
         return result
-    gains  = [max(prices[i] - prices[i-1], 0)       for i in range(1, period + 1)]
-    losses = [abs(min(prices[i] - prices[i-1], 0))  for i in range(1, period + 1)]
-    ag, al = sum(gains) / period, sum(losses) / period
+    gains  = [max(prices[i] - prices[i-1], 0)      for i in range(1, period+1)]
+    losses = [abs(min(prices[i] - prices[i-1], 0)) for i in range(1, period+1)]
+    ag, al = sum(gains)/period, sum(losses)/period
     for i in range(period, len(prices)):
         if i > period:
             d  = prices[i] - prices[i-1]
-            ag = (ag * (period - 1) + max(d, 0))       / period
-            al = (al * (period - 1) + abs(min(d, 0)))  / period
-        rs = ag / al if al else float('inf')
-        result[i] = 100 - (100 / (1 + rs))
+            ag = (ag*(period-1) + max(d, 0))       / period
+            al = (al*(period-1) + abs(min(d, 0)))  / period
+        rs = ag/al if al else float('inf')
+        result[i] = 100 - (100/(1+rs))
     return result
-
-def build_candles(trades, interval_secs=300):
-    if not trades:
-        return []
-    trades = list(reversed(trades))
-    candles = {}
-    for t in trades:
-        ts_raw = t.get("created_at") or t.get("timestamp") or t.get("time", "")
-        try:
-            if str(ts_raw).isdigit():
-                ts = int(ts_raw)
-            else:
-                import datetime
-                ts = int(datetime.datetime.fromisoformat(
-                    str(ts_raw).replace("Z", "+00:00")).timestamp())
-        except Exception:
-            continue
-        bucket = (ts // interval_secs) * interval_secs
-        price  = float(t.get("price", 0))
-        vol    = float(t.get("amount", 0))
-        if bucket not in candles:
-            candles[bucket] = {"open": price, "high": price,
-                               "low": price, "close": price,
-                               "volume": vol, "ts": bucket}
-        else:
-            c = candles[bucket]
-            c["high"]   = max(c["high"], price)
-            c["low"]    = min(c["low"],  price)
-            c["close"]  = price
-            c["volume"] += vol
-    return sorted(candles.values(), key=lambda x: x["ts"])
 
 def get_signal(candles):
     if len(candles) < EMA_SLOW + 5:
-        log.warning(f"Not enough candles ({len(candles)})")
+        log.warning(f"Not enough candles ({len(candles)}) — need {EMA_SLOW+5}")
         return "HOLD"
-    closes  = [c["close"] for c in candles]
-    fast    = ema(closes, EMA_FAST)
-    slow    = ema(closes, EMA_SLOW)
-    rsi_v   = rsi(closes, RSI_PERIOD)
+    closes = [c["close"] for c in candles]
+    fast   = ema(closes, EMA_FAST)
+    slow   = ema(closes, EMA_SLOW)
+    rsi_v  = rsi(closes, RSI_PERIOD)
     i = len(closes) - 1
     while i > 0 and any(v is None for v in [fast[i], slow[i], fast[i-1], slow[i-1]]):
         i -= 1
     if i == 0:
         return "HOLD"
+    rsi_str = f"{rsi_v[i]:.1f}" if rsi_v[i] is not None else "N/A"
     log.info(f"Price:{closes[-1]:.4f}  EMA{EMA_FAST}:{fast[i]:.4f}  "
-             f"EMA{EMA_SLOW}:{slow[i]:.4f}  RSI:{rsi_v[i]:.1f if rsi_v[i] else 'N/A'}")
-    if fast[i-1] <= slow[i-1] and fast[i] > slow[i]:
-        if rsi_v[i] is None or rsi_v[i] < RSI_OB:  return "BUY"
-    if fast[i-1] >= slow[i-1] and fast[i] < slow[i]:
-        if rsi_v[i] is None or rsi_v[i] > RSI_OS:  return "SELL"
+             f"EMA{EMA_SLOW}:{slow[i]:.4f}  RSI:{rsi_str}")
+    crossed_up   = fast[i-1] <= slow[i-1] and fast[i] > slow[i]
+    crossed_down = fast[i-1] >= slow[i-1] and fast[i] < slow[i]
+    if crossed_up   and (rsi_v[i] is None or rsi_v[i] < RSI_OB):  return "BUY"
+    if crossed_down and (rsi_v[i] is None or rsi_v[i] > RSI_OS):  return "SELL"
     return "HOLD"
 
 
@@ -283,15 +289,16 @@ def save_state(s):
         json.dump(s, f)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main Loop ─────────────────────────────────────────────────────────────────
 
 def run():
     if not PUBLIC_KEY or not PRIVATE_KEY:
-        log.error("Missing API keys!")
+        log.error("Missing CHAINEX_PUBLIC_KEY or CHAINEX_PRIVATE_KEY!")
         return
 
     client = ChainEXClient(PUBLIC_KEY, PRIVATE_KEY)
 
+    # Bootstrap: get live XRP balance for initial state
     try:
         init_bal = client.get_balances()
         init_xrp = init_bal.get("XRP", {}).get("available", 0.0)
@@ -302,9 +309,10 @@ def run():
     state = load_state(xrp_balance=init_xrp)
 
     log.info("=" * 55)
-    log.info(f"  ChainEX XRP/ZAR Bot  |  EMA {EMA_FAST}/{EMA_SLOW}")
-    log.info(f"  RSI OB={RSI_OB} OS={RSI_OS}  |  Sizing: {int(TRADE_PCT*100)}%")
-    log.info(f"  Poll: {POLL_SECS}s  |  In position: {state['in_position']}")
+    log.info(f"  ChainEX XRP/ZAR Bot  v5 | EMA {EMA_FAST}/{EMA_SLOW}")
+    log.info(f"  Price source: CoinGecko (XRP/ZAR)")
+    log.info(f"  RSI OB={RSI_OB} OS={RSI_OS} | Sizing: {int(TRADE_PCT*100)}%")
+    log.info(f"  Poll: {POLL_SECS}s | In position: {state['in_position']}")
     log.info(f"  XRP tracked: {state['xrp_amount']:.4f}")
     log.info("=" * 55)
 
@@ -312,66 +320,73 @@ def run():
         try:
             t0 = time.time()
 
-            trades  = client.get_trade_history(COIN, EXCHANGE, 200)
-            candles = build_candles(trades, POLL_SECS)
-            log.info(f"Candles: {len(candles)}")
-
+            # ── 1. Get candles from CoinGecko ─────────────────────────────
+            candles = fetch_candles()
             if not candles:
-                log.warning("No candles — check trade history endpoint.")
+                log.warning("No candle data this cycle.")
                 time.sleep(POLL_SECS)
                 continue
 
-            current_price = candles[-1]["close"]
-            log.info(f"XRP/ZAR: R{current_price:.4f}")
+            current_price = fetch_current_price() or candles[-1]["close"]
+            log.info(f"XRP/ZAR spot: R{current_price:.4f}")
 
-            signal   = get_signal(candles)
+            # ── 2. Signal ─────────────────────────────────────────────────
+            signal = get_signal(candles)
             log.info(f"Signal: {signal}")
 
+            # ── 3. Balances ───────────────────────────────────────────────
             balances = client.get_balances()
             zar_bal  = balances.get("ZAR", {}).get("available", 0.0)
             xrp_bal  = balances.get("XRP", {}).get("available", 0.0)
             log.info(f"ZAR: R{zar_bal:.2f}  XRP: {xrp_bal:.4f}")
 
+            # ── 4. Execute ────────────────────────────────────────────────
             if signal == "BUY" and not state["in_position"]:
                 spend = TRADE_ZAR if TRADE_ZAR > 0 else zar_bal * TRADE_PCT
                 spend = min(spend, zar_bal)
                 if spend < 10:
-                    log.warning(f"ZAR too low (R{zar_bal:.2f})")
+                    log.warning(f"ZAR too low to buy (R{zar_bal:.2f})")
                 else:
-                    book      = client.get_orderbook(COIN, EXCHANGE)
+                    book      = client.get_orderbook()
                     asks      = book.get("ask", [])
-                    buy_price = float(asks[0]["price"]) * 1.001 if asks else current_price * 1.002
+                    buy_price = (float(asks[0]["price"]) * 1.001
+                                 if asks else current_price * 1.002)
                     xrp_qty   = spend / buy_price
                     log.info(f"BUY {xrp_qty:.4f} XRP @ R{buy_price:.4f} (R{spend:.2f})")
-                    client.place_order(COIN, EXCHANGE, buy_price, xrp_qty, "buy")
-                    state.update({"in_position": True, "entry_price": buy_price,
-                                  "xrp_amount": xrp_qty})
+                    client.place_order(buy_price, xrp_qty, "buy")
+                    state.update({"in_position": True,
+                                  "entry_price": buy_price,
+                                  "xrp_amount":  xrp_qty})
                     save_state(state)
 
             elif signal == "SELL" and state["in_position"]:
                 sell_qty = (min(state["xrp_amount"], xrp_bal)
                             if state["xrp_amount"] > 0 else xrp_bal) * 0.99
                 if sell_qty < 1:
-                    log.warning(f"Not enough XRP ({xrp_bal:.4f}). Resetting.")
-                    state.update({"in_position": False, "entry_price": 0.0, "xrp_amount": 0.0})
+                    log.warning(f"Not enough XRP ({xrp_bal:.4f}). Resetting state.")
+                    state.update({"in_position": False,
+                                  "entry_price": 0.0, "xrp_amount": 0.0})
                     save_state(state)
                 else:
-                    book       = client.get_orderbook(COIN, EXCHANGE)
+                    book       = client.get_orderbook()
                     bids       = book.get("bid", [])
-                    sell_price = float(bids[0]["price"]) * 0.999 if bids else current_price * 0.998
-                    pnl_str    = (f"R{(sell_price - state['entry_price']) * sell_qty:.2f}"
-                                  if state["entry_price"] > 0 else "unknown entry")
+                    sell_price = (float(bids[0]["price"]) * 0.999
+                                  if bids else current_price * 0.998)
+                    pnl = ((sell_price - state["entry_price"]) * sell_qty
+                           if state["entry_price"] > 0 else None)
+                    pnl_str = f"R{pnl:.2f}" if pnl is not None else "unknown entry"
                     log.info(f"SELL {sell_qty:.4f} XRP @ R{sell_price:.4f} (PnL: {pnl_str})")
-                    client.place_order(COIN, EXCHANGE, sell_price, sell_qty, "sell")
-                    state.update({"in_position": False, "entry_price": 0.0, "xrp_amount": 0.0})
+                    client.place_order(sell_price, sell_qty, "sell")
+                    state.update({"in_position": False,
+                                  "entry_price": 0.0, "xrp_amount": 0.0})
                     save_state(state)
             else:
-                log.info("HOLD.")
+                log.info("HOLD — no action this cycle.")
 
         except requests.exceptions.RequestException as e:
             log.error(f"Network error: {e}")
         except Exception as e:
-            log.exception(f"Error: {e}")
+            log.exception(f"Unexpected error: {e}")
 
         sleep_for = max(POLL_SECS - (time.time() - t0), 10)
         log.info(f"Sleeping {sleep_for:.0f}s...\n")
