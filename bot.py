@@ -1,8 +1,8 @@
 """
-ChainEX XRP/ZAR EMA Crossover Bot  (v5 — CoinGecko price data)
-Strategy: 9/21 EMA crossover + RSI filter
+ChainEX XRP/ZAR MSG Strategy Bot
+Strategy : MSG — EMA 21/55 + RSI + Volume confirmation (all 4 required)
 Price data: CoinGecko free API (no key needed)
-Orders/Balances: ChainEX API
+Orders    : ChainEX API
 """
 
 import os
@@ -27,32 +27,39 @@ PRIVATE_KEY = os.environ.get("CHAINEX_PRIVATE_KEY", "")
 COIN     = "XRP"
 EXCHANGE = "ZAR"
 
-EMA_FAST   = int(os.environ.get("EMA_FAST", 9))
-EMA_SLOW   = int(os.environ.get("EMA_SLOW", 21))
-RSI_PERIOD = int(os.environ.get("RSI_PERIOD", 14))
-RSI_OB     = float(os.environ.get("RSI_OB", 70))
-RSI_OS     = float(os.environ.get("RSI_OS", 30))
+# ── MSG Indicator Settings ────────────────────────────────────────────────────
+EMA_FAST   = 21      # MSG: was 9
+EMA_SLOW   = 55      # MSG: was 21
+RSI_PERIOD = 14
+RSI_BULL   = 55.0    # MSG: RSI must be above 55 for buy (was OB=70)
+RSI_BEAR   = 45.0    # MSG: RSI must be below 45 for sell (was OS=30)
 
+# ── ATR Settings ──────────────────────────────────────────────────────────────
+ATR_PERIOD        = 14
+ATR_SL_MULTIPLIER = 1.5
+ATR_TP_MULTIPLIER = 1.2
+
+# ── Trade Sizing ──────────────────────────────────────────────────────────────
 TRADE_ZAR  = float(os.environ.get("TRADE_ZAR", 0))
 TRADE_PCT  = float(os.environ.get("TRADE_PCT", 0.95))
 
 START_IN_POSITION = os.environ.get("START_IN_POSITION", "true").lower() == "true"
 POLL_SECS  = int(os.environ.get("POLL_SECS", 300))   # 5 min candles
 
-# CoinGecko: 'ripple' = XRP, vs_currency = 'zar', days of history
+# ── CoinGecko Settings ────────────────────────────────────────────────────────
 COINGECKO_COIN = "ripple"
 COINGECKO_VS   = "zar"
-COINGECKO_DAYS = 2    # last 2 days gives 5-min candles (free tier)
+COINGECKO_DAYS = 3    # 3 days gives enough hourly candles for EMA55
 
 CHAINEX_BASE = "https://api.chainex.io"
 
 
-# ── Price data from CoinGecko ─────────────────────────────────────────────────
+# ── Price Data from CoinGecko ─────────────────────────────────────────────────
 
 def fetch_candles() -> list:
     """
-    CoinGecko /coins/{id}/market_chart -- free tier, no key needed.
-    Returns hourly price points for last 2 days.
+    CoinGecko /coins/{id}/market_chart — free tier, no key needed.
+    Returns hourly price points — need at least 60+ for EMA55.
     """
     url = (f"https://api.coingecko.com/api/v3/coins/{COINGECKO_COIN}"
            f"/market_chart?vs_currency={COINGECKO_VS}&days={COINGECKO_DAYS}"
@@ -61,13 +68,19 @@ def fetch_candles() -> list:
         r = requests.get(url, timeout=15,
                          headers={"Accept": "application/json"})
         r.raise_for_status()
-        prices = r.json().get("prices", [])
-        candles = [
-            {"ts": p[0] // 1000, "open": p[1], "high": p[1],
-             "low": p[1], "close": p[1]}
-            for p in prices
-        ]
-        log.info(f"CoinGecko: {len(candles)} price points (XRP/ZAR)")
+        prices  = r.json().get("prices", [])
+        volumes = r.json().get("total_volumes", [])
+
+        # Zip price and volume together
+        candles = []
+        for i, p in enumerate(prices):
+            vol = volumes[i][1] if i < len(volumes) else 0
+            candles.append({
+                "ts":     p[0] // 1000,
+                "close":  p[1],
+                "volume": vol
+            })
+        log.info(f"CoinGecko: {len(candles)} candles (XRP/ZAR)")
         return candles
     except Exception as e:
         log.error(f"CoinGecko fetch failed: {e}")
@@ -75,7 +88,6 @@ def fetch_candles() -> list:
 
 
 def fetch_current_price() -> float:
-    """Simple spot price from CoinGecko."""
     url = (f"https://api.coingecko.com/api/v3/simple/price"
            f"?ids={COINGECKO_COIN}&vs_currencies={COINGECKO_VS}")
     try:
@@ -87,7 +99,7 @@ def fetch_current_price() -> float:
         return 0.0
 
 
-# ── ChainEX API Client (orders + balances only) ───────────────────────────────
+# ── ChainEX API Client ────────────────────────────────────────────────────────
 
 class ChainEXClient:
     def __init__(self, pub, priv):
@@ -102,15 +114,11 @@ class ChainEXClient:
         ).hexdigest()
 
     def _request(self, endpoint: str, body: dict = None) -> dict:
-        """
-        Try multiple auth styles until one works.
-        Logs exactly what came back so we can tune if needed.
-        """
-        body = body or {}
+        body     = body or {}
         nonce    = str(int(time.time() * 1000))
         body_str = json.dumps(body, separators=(',', ':')) if body else "{}"
 
-        # Style A: JSON body + header auth (most modern exchanges)
+        # Style A: JSON body + header auth
         try:
             sig = self._sign(body_str)
             headers = {
@@ -205,7 +213,7 @@ class ChainEXClient:
             "exchange_code": EXCHANGE,
             "price":         str(round(price, 4)),
             "amount":        str(round(amount, 4)),
-            "type":          side,   # "buy" or "sell"
+            "type":          side,
         }
         for ep in ["/trading/addorder", "/order/add", "/trade/add"]:
             data = self._request(ep, body)
@@ -218,8 +226,8 @@ class ChainEXClient:
 
 # ── Indicators ────────────────────────────────────────────────────────────────
 
-def ema(prices, period):
-    k = 2 / (period + 1)
+def calc_ema(prices, period):
+    k      = 2 / (period + 1)
     result = [None] * len(prices)
     if len(prices) < period:
         return result
@@ -228,7 +236,7 @@ def ema(prices, period):
         result[i] = prices[i] * k + result[i - 1] * (1 - k)
     return result
 
-def rsi(prices, period=14):
+def calc_rsi(prices, period=14):
     result = [None] * len(prices)
     if len(prices) < period + 1:
         return result
@@ -244,27 +252,84 @@ def rsi(prices, period=14):
         result[i] = 100 - (100/(1+rs))
     return result
 
+def calc_atr(candles, period=14):
+    """ATR using close-to-close since CoinGecko only gives close prices."""
+    closes = [c["close"] for c in candles]
+    trs    = [abs(closes[i] - closes[i-1]) for i in range(1, len(closes))]
+    if len(trs) < period:
+        return 0.0
+    atr = sum(trs[:period]) / period
+    for i in range(period, len(trs)):
+        atr = (atr * (period - 1) + trs[i]) / period
+    return atr
+
+
+# ── MSG Signal Logic ──────────────────────────────────────────────────────────
+
 def get_signal(candles):
     if len(candles) < EMA_SLOW + 5:
-        log.warning(f"Not enough candles ({len(candles)}) — need {EMA_SLOW+5}")
-        return "HOLD"
-    closes = [c["close"] for c in candles]
-    fast   = ema(closes, EMA_FAST)
-    slow   = ema(closes, EMA_SLOW)
-    rsi_v  = rsi(closes, RSI_PERIOD)
+        log.warning(f"Not enough candles ({len(candles)}) — need {EMA_SLOW + 5}")
+        return "HOLD", 0.0
+
+    closes  = [c["close"]  for c in candles]
+    volumes = [c["volume"] for c in candles]
+
+    ema21   = calc_ema(closes, EMA_FAST)
+    ema55   = calc_ema(closes, EMA_SLOW)
+    rsi_val = calc_rsi(closes, RSI_PERIOD)
+
     i = len(closes) - 1
-    while i > 0 and any(v is None for v in [fast[i], slow[i], fast[i-1], slow[i-1]]):
+    # Walk back to find valid index
+    while i > 0 and any(v is None for v in [ema21[i], ema55[i]]):
         i -= 1
     if i == 0:
-        return "HOLD"
-    rsi_str = f"{rsi_v[i]:.1f}" if rsi_v[i] is not None else "N/A"
-    log.info(f"Price:{closes[-1]:.4f}  EMA{EMA_FAST}:{fast[i]:.4f}  "
-             f"EMA{EMA_SLOW}:{slow[i]:.4f}  RSI:{rsi_str}")
-    crossed_up   = fast[i-1] <= slow[i-1] and fast[i] > slow[i]
-    crossed_down = fast[i-1] >= slow[i-1] and fast[i] < slow[i]
-    if crossed_up   and (rsi_v[i] is None or rsi_v[i] < RSI_OB):  return "BUY"
-    if crossed_down and (rsi_v[i] is None or rsi_v[i] > RSI_OS):  return "SELL"
-    return "HOLD"
+        return "HOLD", 0.0
+
+    curr_ema21 = ema21[i]
+    curr_ema55 = ema55[i]
+    curr_rsi   = rsi_val[i]
+    curr_vol   = volumes[i]
+    prev_vol   = volumes[i-1]
+    curr_price = closes[i]
+
+    # ── MSG Rule 1: Trend ─────────────────────────────────────────────────────
+    bull_trend = curr_ema21 > curr_ema55
+    bear_trend = curr_ema21 < curr_ema55
+
+    # ── MSG Rule 2: Price vs EMA21 ────────────────────────────────────────────
+    price_above_ema = curr_price > curr_ema21
+    price_below_ema = curr_price < curr_ema21
+
+    # ── MSG Rule 3: RSI ───────────────────────────────────────────────────────
+    rsi_bull = curr_rsi is not None and curr_rsi > RSI_BULL
+    rsi_bear = curr_rsi is not None and curr_rsi < RSI_BEAR
+
+    # ── MSG Rule 4: Volume — current > previous bar ───────────────────────────
+    vol_confirm = curr_vol > prev_vol
+
+    rsi_str = f"{curr_rsi:.1f}" if curr_rsi is not None else "N/A"
+
+    log.info(
+        f"MSG | Price: R{curr_price:.4f} | "
+        f"EMA21: {curr_ema21:.4f} | EMA55: {curr_ema55:.4f} | "
+        f"RSI: {rsi_str} | Vol>Prev: {vol_confirm} | "
+        f"BullTrend: {bull_trend} | BearTrend: {bear_trend}"
+    )
+
+    # ── All 4 conditions must be true ─────────────────────────────────────────
+    atr = calc_atr(candles[-ATR_PERIOD*2:], ATR_PERIOD)
+
+    if bull_trend and price_above_ema and rsi_bull and vol_confirm:
+        log.info("✅ MSG BUY — all 4 conditions met")
+        return "BUY", atr
+
+    elif bear_trend and price_below_ema and rsi_bear and vol_confirm:
+        log.info("🔴 MSG SELL — all 4 conditions met")
+        return "SELL", atr
+
+    else:
+        log.info("⏳ HOLD — not all MSG conditions met")
+        return "HOLD", atr
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -279,9 +344,11 @@ def load_state(xrp_balance=0.0):
         pass
     if START_IN_POSITION:
         log.info(f"Bootstrapping in_position=True with {xrp_balance:.4f} XRP.")
-        state = {"in_position": True, "entry_price": 0.0, "xrp_amount": xrp_balance}
+        state = {"in_position": True, "entry_price": 0.0,
+                 "xrp_amount": xrp_balance, "stop_loss": 0.0, "take_profit": 0.0}
     else:
-        state = {"in_position": False, "entry_price": 0.0, "xrp_amount": 0.0}
+        state = {"in_position": False, "entry_price": 0.0,
+                 "xrp_amount": 0.0, "stop_loss": 0.0, "take_profit": 0.0}
     save_state(state)
     return state
 
@@ -299,7 +366,6 @@ def run():
 
     client = ChainEXClient(PUBLIC_KEY, PRIVATE_KEY)
 
-    # Bootstrap: get live XRP balance for initial state
     try:
         init_bal = client.get_balances()
         init_xrp = init_bal.get("XRP", {}).get("available", 0.0)
@@ -309,19 +375,19 @@ def run():
 
     state = load_state(xrp_balance=init_xrp)
 
-    log.info("=" * 55)
-    log.info(f"  ChainEX XRP/ZAR Bot  v5 | EMA {EMA_FAST}/{EMA_SLOW}")
-    log.info(f"  Price source: CoinGecko (XRP/ZAR)")
-    log.info(f"  RSI OB={RSI_OB} OS={RSI_OS} | Sizing: {int(TRADE_PCT*100)}%")
+    log.info("=" * 60)
+    log.info(f"  ChainEX XRP/ZAR — MSG Strategy Bot")
+    log.info(f"  EMA: {EMA_FAST}/{EMA_SLOW} | RSI Bull: >{RSI_BULL} | RSI Bear: <{RSI_BEAR}")
+    log.info(f"  ATR SL: {ATR_SL_MULTIPLIER}x | ATR TP: {ATR_TP_MULTIPLIER}x")
     log.info(f"  Poll: {POLL_SECS}s | In position: {state['in_position']}")
     log.info(f"  XRP tracked: {state['xrp_amount']:.4f}")
-    log.info("=" * 55)
+    log.info("=" * 60)
 
     while True:
         try:
             t0 = time.time()
 
-            # ── 1. Get candles from CoinGecko ─────────────────────────────
+            # ── 1. Fetch candles ──────────────────────────────────────────
             candles = fetch_candles()
             if not candles:
                 log.warning("No candle data this cycle.")
@@ -331,9 +397,9 @@ def run():
             current_price = fetch_current_price() or candles[-1]["close"]
             log.info(f"XRP/ZAR spot: R{current_price:.4f}")
 
-            # ── 2. Signal ─────────────────────────────────────────────────
-            signal = get_signal(candles)
-            log.info(f"Signal: {signal}")
+            # ── 2. MSG Signal ─────────────────────────────────────────────
+            signal, atr = get_signal(candles)
+            log.info(f"Signal: {signal} | ATR: {atr:.4f}")
 
             # ── 3. Balances ───────────────────────────────────────────────
             balances = client.get_balances()
@@ -341,7 +407,37 @@ def run():
             xrp_bal  = balances.get("XRP", {}).get("available", 0.0)
             log.info(f"ZAR: R{zar_bal:.2f}  XRP: {xrp_bal:.4f}")
 
-            # ── 4. Execute ────────────────────────────────────────────────
+            # ── 4. SL/TP Check while in position ─────────────────────────
+            if state["in_position"] and state["stop_loss"] and state["take_profit"]:
+                if current_price <= state["stop_loss"]:
+                    log.info(f"🛑 Stop loss hit | Price: R{current_price:.4f} | SL: R{state['stop_loss']:.4f}")
+                    sell_qty = min(state["xrp_amount"], xrp_bal) * 0.99
+                    if sell_qty >= 1:
+                        book       = client.get_orderbook()
+                        bids       = book.get("bid", [])
+                        sell_price = float(bids[0]["price"]) * 0.999 if bids else current_price * 0.998
+                        client.place_order(sell_price, sell_qty, "sell")
+                    state.update({"in_position": False, "entry_price": 0.0,
+                                  "xrp_amount": 0.0, "stop_loss": 0.0, "take_profit": 0.0})
+                    save_state(state)
+                    time.sleep(POLL_SECS)
+                    continue
+
+                elif current_price >= state["take_profit"]:
+                    log.info(f"🎯 Take profit hit | Price: R{current_price:.4f} | TP: R{state['take_profit']:.4f}")
+                    sell_qty = min(state["xrp_amount"], xrp_bal) * 0.99
+                    if sell_qty >= 1:
+                        book       = client.get_orderbook()
+                        bids       = book.get("bid", [])
+                        sell_price = float(bids[0]["price"]) * 0.999 if bids else current_price * 0.998
+                        client.place_order(sell_price, sell_qty, "sell")
+                    state.update({"in_position": False, "entry_price": 0.0,
+                                  "xrp_amount": 0.0, "stop_loss": 0.0, "take_profit": 0.0})
+                    save_state(state)
+                    time.sleep(POLL_SECS)
+                    continue
+
+            # ── 5. Execute Signal ─────────────────────────────────────────
             if signal == "BUY" and not state["in_position"]:
                 spend = TRADE_ZAR if TRADE_ZAR > 0 else zar_bal * TRADE_PCT
                 spend = min(spend, zar_bal)
@@ -350,14 +446,22 @@ def run():
                 else:
                     book      = client.get_orderbook()
                     asks      = book.get("ask", [])
-                    buy_price = (float(asks[0]["price"]) * 1.001
-                                 if asks else current_price * 1.002)
+                    buy_price = float(asks[0]["price"]) * 1.001 if asks else current_price * 1.002
                     xrp_qty   = spend / buy_price
-                    log.info(f"BUY {xrp_qty:.4f} XRP @ R{buy_price:.4f} (R{spend:.2f})")
+                    sl        = buy_price - (ATR_SL_MULTIPLIER * atr)
+                    tp        = buy_price + (ATR_TP_MULTIPLIER * atr)
+                    log.info(
+                        f"✅ BUY {xrp_qty:.4f} XRP @ R{buy_price:.4f} "
+                        f"(R{spend:.2f}) | SL: R{sl:.4f} | TP: R{tp:.4f}"
+                    )
                     client.place_order(buy_price, xrp_qty, "buy")
-                    state.update({"in_position": True,
-                                  "entry_price": buy_price,
-                                  "xrp_amount":  xrp_qty})
+                    state.update({
+                        "in_position": True,
+                        "entry_price": buy_price,
+                        "xrp_amount":  xrp_qty,
+                        "stop_loss":   sl,
+                        "take_profit": tp,
+                    })
                     save_state(state)
 
             elif signal == "SELL" and state["in_position"]:
@@ -365,24 +469,23 @@ def run():
                             if state["xrp_amount"] > 0 else xrp_bal) * 0.99
                 if sell_qty < 1:
                     log.warning(f"Not enough XRP ({xrp_bal:.4f}). Resetting state.")
-                    state.update({"in_position": False,
-                                  "entry_price": 0.0, "xrp_amount": 0.0})
+                    state.update({"in_position": False, "entry_price": 0.0,
+                                  "xrp_amount": 0.0, "stop_loss": 0.0, "take_profit": 0.0})
                     save_state(state)
                 else:
                     book       = client.get_orderbook()
                     bids       = book.get("bid", [])
-                    sell_price = (float(bids[0]["price"]) * 0.999
-                                  if bids else current_price * 0.998)
-                    pnl = ((sell_price - state["entry_price"]) * sell_qty
-                           if state["entry_price"] > 0 else None)
-                    pnl_str = f"R{pnl:.2f}" if pnl is not None else "unknown entry"
-                    log.info(f"SELL {sell_qty:.4f} XRP @ R{sell_price:.4f} (PnL: {pnl_str})")
+                    sell_price = float(bids[0]["price"]) * 0.999 if bids else current_price * 0.998
+                    pnl        = (sell_price - state["entry_price"]) * sell_qty if state["entry_price"] > 0 else None
+                    pnl_str    = f"R{pnl:.2f}" if pnl is not None else "unknown entry"
+                    log.info(f"🔴 SELL {sell_qty:.4f} XRP @ R{sell_price:.4f} | PnL: {pnl_str}")
                     client.place_order(sell_price, sell_qty, "sell")
-                    state.update({"in_position": False,
-                                  "entry_price": 0.0, "xrp_amount": 0.0})
+                    state.update({"in_position": False, "entry_price": 0.0,
+                                  "xrp_amount": 0.0, "stop_loss": 0.0, "take_profit": 0.0})
                     save_state(state)
+
             else:
-                log.info("HOLD — no action this cycle.")
+                log.info("⏳ HOLD — no MSG signal this cycle.")
 
         except requests.exceptions.RequestException as e:
             log.error(f"Network error: {e}")
